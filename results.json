@@ -1,0 +1,6 @@
+{
+    "last_training": {
+        "timesteps": 20000,
+        "total_reward": 0.0
+    }
+}

@@ -1,0 +1,23 @@
+# Klient API dla wielu giełd, w tym Bybit
+ccxt==3.0.36    # Obsługuje wiele giełd, w tym Bybit
+
+# Obsługa danych
+pandas==2.1.1   # Analiza i manipulacja danymi
+numpy==1.24.3   # Operacje numeryczne
+
+# Moduł AI
+tensorflow==2.13.0  # Framework do budowy i trenowania modeli AI
+
+# Logowanie i pomocnicze
+loguru==0.7.0   # Zaawansowane logowanie
+
+# Dodatkowe opcje do testowania i uruchamiania w środowisku produkcyjnym
+pytest==7.4.0   # Testowanie aplikacji
+python-dotenv==1.0.0   # Zarządzanie zmiennymi środowiskowymi (opcjonalne)
+scikit-learn==1.2.2  # Jeśli używasz scikit-learn do AI
+pybit==5.7
+gym
+numpy
+pandas
+pybit
+stable-baselines3
