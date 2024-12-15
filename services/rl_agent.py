@@ -1,106 +1,170 @@
 import os
-import json
+import logging
+import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import EvalCallback
 from services.rl_trading_env import TradingEnv
+import torch
+import re  # Dodaj import na początku pliku
+
+
+logging.basicConfig(filename="trading_bot.log", level=logging.INFO)
 
 
 class RLAgent:
-    def __init__(
-        self, client, model_filepath="rl_model", results_filepath="results.json"
-    ):
-        self.client = client
-        self.env = TradingEnv(client)
-        self.model_filepath = model_filepath
-        self.results_filepath = results_filepath
+    def __init__(self, client, window_size=30, learning_rate=0.0003, gamma=0.99):
+        """
+        Inicjalizacja agenta RL z użyciem Stable-Baselines3.
+        """
+        self.window_size = window_size
+        self.learning_rate = learning_rate
+        self.gamma = gamma
 
-        # Jeśli istnieje zapisany model, wczytaj go
-        if os.path.exists(self.model_filepath + ".zip"):
-            self.load_model(self.model_filepath)
-            print(f"Wczytano istniejący model z {self.model_filepath}")
-        else:
-            # Twórz nowy model, jeśli nie istnieje zapisany
-            self.model = PPO("MlpPolicy", self.env, verbose=1)
+        # Tworzenie środowiska
+        self.env = TradingEnv(client=client, window_size=window_size, interval="5")
+        self.eval_env = TradingEnv(
+            client=client, window_size=window_size, interval="5"
+        )  # Środowisko do ewaluacji
 
-    def train(self, timesteps=20000):
-        # Sprawdź, czy środowisko jest prawidłowo zainicjalizowane
-        if self.env is None:
-            print("Błąd: Środowisko nie zostało zainicjalizowane.")
-            return
-        self.model.learn(total_timesteps=timesteps)
-        # Zapisz model po treningu
-        self.save_model(self.model_filepath)
+        # Tworzenie modelu PPO z Stable-Baselines3
+        self.model = PPO(
+            "MlpPolicy",
+            self.env,
+            learning_rate=self.learning_rate,
+            gamma=self.gamma,
+            verbose=1,
+        )
 
-    def evaluate(self, save_results=False):
-        obs = self.env.reset()
-        done = False
-        total_reward = 0
-        steps = 0
+        # Inicjalizacja do wizualizacji
+        self.reward_history = []
+        self.evaluation_rewards = []
+        self.transaction_history = []
 
-        while not done:
-            action, _states = self.model.predict(obs)
-            obs, reward, done, _ = self.env.step(action)
-            total_reward += reward
-            steps += 1
+    def train(self, timesteps=10000, eval_freq=5000):
+        """
+        Trening modelu przez określoną liczbę kroków.
+        """
+        # Callback do ewaluacji modelu podczas treningu
+        eval_callback = EvalCallback(
+            self.eval_env,
+            best_model_save_path="./logs/",
+            log_path="./logs/",
+            eval_freq=eval_freq,
+            deterministic=True,
+            render=False,
+        )
 
-        if save_results:
-            self.save_evaluation_results(
-                {
-                    "total_reward": total_reward,
-                    "steps": steps,
-                    "parameters": {
-                        "timesteps": 20000,  # Możesz tu dodać dynamiczne parametry
-                    },
-                }
-            )
+        # Rozpoczęcie treningu
+        self.model.learn(total_timesteps=timesteps, callback=eval_callback)
 
-        return total_reward
+        # Po zakończeniu treningu zapisujemy model i wizualizujemy wyniki
+        self.save_model()
+        self.plot_results()
+        logging.info("Model został wytrenowany i zapisany.")
 
-    def save_model(self, filepath="rl_model"):
+    def evaluate(self, episodes=1):
+        """
+        Ewaluacja agenta na podstawie średniego zysku z kilku epizodów.
+        """
+        total_rewards = []
+
+        for episode in range(episodes):
+            obs = self.eval_env.reset()
+            done = False
+            episode_reward = 0
+
+            while not done:
+                action, _ = self.model.predict(
+                    obs,
+                    deterministic=True,
+                )
+                obs, reward, done, info = self.eval_env.step(action)
+                episode_reward += reward
+                #print(
+                #    f"Action: {action}, Reward: {reward}, Info: {info}"
+                #)  # Dodaj logowanie akcji i nagrody
+
+            total_rewards.append(episode_reward)
+
+        avg_reward = sum(total_rewards) / len(total_rewards)
+        self.evaluation_rewards.append(avg_reward)
+        logging.info(f"total_rewards: {total_rewards}")
+        logging.info(f"Średnia nagroda w ewaluacji: {avg_reward}")
+        return avg_reward
+
+    def save_model(self, filepath="ppo_model"):
+        """
+        Zapis modelu do pliku.
+        """
         self.model.save(filepath)
+        logging.info(f"Model zapisano do pliku {filepath}")
 
     def load_model(self, filepath="rl_model"):
         current_directory = os.getcwd()  # Bieżący katalog roboczy
         full_filepath = os.path.join(
-            current_directory, filepath + ".zip"
+            current_directory, filepath
         )  # Pełna ścieżka do pliku
 
         print(f"Bieżący katalog roboczy: {current_directory}")
         print(f"Pełna ścieżka pliku modelu: {full_filepath}")
 
         if os.path.exists(full_filepath):
-            self.model = PPO.load(full_filepath)
+            self.model = PPO.load(full_filepath, env=self.env)
             print(f"Model załadowany z {full_filepath}")
         else:
             print(f"Model {full_filepath} nie istnieje!")
 
-    def save_evaluation_results(self, results):
-        try:
-            # Jeśli plik istnieje, odczytaj istniejące wyniki
-            try:
-                with open(self.results_filepath, "r") as f:
-                    existing_results = json.load(f)
-            except FileNotFoundError:
-                existing_results = []
+    def plot_results(self):
+        """
+        Wizualizacja wyników treningu i ewaluacji.
+        """
+        # Wizualizacja nagród z ewaluacji
+        plt.figure(figsize=(12, 6))
 
-            # Dodaj nowe wyniki do istniejących
-            existing_results.append(results)
+        if self.evaluation_rewards:
+            plt.subplot(1, 2, 1)
+            plt.plot(self.evaluation_rewards, label="Evaluation Rewards")
+            plt.title("Evaluation Rewards History")
+            plt.xlabel("Evaluation Steps")
+            plt.ylabel("Average Reward")
+            plt.legend()
 
-            # Zapisz całość do pliku JSON
-            with open(self.results_filepath, "w") as f:
-                json.dump(existing_results, f, indent=4)
-            print(f"Wyniki ewaluacji zapisano w {self.results_filepath}")
-        except Exception as e:
-            print(f"Błąd zapisu wyników: {e}")
+        # Wyświetlanie historii transakcji
+        self.transaction_history = self.env.get_transaction_history()
+        if self.transaction_history:
+            plt.subplot(1, 2, 2)
+            profits = [
+                t[4] if len(t) == 5 else 0 for t in self.transaction_history
+            ]  # Wyciąganie zysków/strat z transakcji
+            plt.plot(profits, label="Transaction Profits")
+            plt.title("Transaction Profits")
+            plt.xlabel("Transactions")
+            plt.ylabel("Profit/Loss")
+            plt.legend()
 
-    def load_evaluation_results(self):
-        try:
-            with open(self.results_filepath, "r") as f:
-                results = json.load(f)
-            print(f"Wczytano wyniki: {results}")
-            return results
-        except FileNotFoundError:
-            print(f"Plik {self.results_filepath} nie istnieje.")
-            return []
-        except Exception as e:
-            print(f"Błąd odczytu wyników: {e}")
-            return []
+        plt.tight_layout()
+        plt.savefig("training_results.png")
+        plt.close()
+
+        # Logowanie transakcji
+        logging.info(f"Transaction History ({len(self.transaction_history)}):")
+        for transaction in self.transaction_history:
+            if transaction[0] == "long":  # Kupno (otwarcie pozycji long)
+                logging.info(
+                    f"Open long at {transaction[1]} for quantity {transaction[2]}, Balance: {transaction[3]}"
+                )
+            elif transaction[0] == "short":  # Sprzedaż (otwarcie short)
+                logging.info(
+                    f" Open short at {transaction[1]} for quantity {transaction[2]}, Balance: {transaction[3]}"
+                )
+            elif re.match(r"Close Position", transaction[0]):  # Zamknięcie pozycji long
+                if len(transaction) == 5:  # Sprawdzamy, czy mamy zysk/stratę
+                    logging.info(
+                        f"Close Position at {transaction[1]} for quantity {transaction[2]}, "
+                        f"Balance: {transaction[3]}, Profit/Loss: {transaction[4]}"
+                    )
+                else:
+                    logging.warning(f"Invalid transaction format: {transaction}")
+            else:
+                logging.warning(f"Invalid transaction format: {transaction}")

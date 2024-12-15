@@ -48,10 +48,6 @@ def main():
     # Test połączenia z API Bybit
     data_service.test_connection()
 
-    # Uruchomienie strategii AI
-    # ai_service = AIStrategy(client)
-    # acktester = Backtester(ai_service)
-
     # Dodanie agenta RL
     rl_agent = RLAgent(client)
 
@@ -65,18 +61,14 @@ def main():
     else:
         print("Brak danych rynkowych! Upewnij się, że API zwraca poprawne dane.")
 
-    # Nie uruchamiaj treningu ani ewaluacji
-    logging.info("Finished inspecting the market data.")
-
     # Wczytanie wyników
     results_filepath = "results.json"
-    model_filepath = "rl_model.zip"
+    model_filepath = "ppo_model.zip"
     results = load_results(results_filepath)
 
     # Sprawdzenie, czy istnieje zapisany model
     try:
         rl_agent.load_model(model_filepath)
-        logging.info("Loaded RL agent model from file.")
     except FileNotFoundError:
         logging.warning("Model file not found. Starting with a new model.")
 
@@ -90,15 +82,11 @@ def main():
     logging.info(f"RL agent evaluation total reward: {total_reward}")
 
     # Aktualizacja wyników
-    results["last_training"] = {
-        "timesteps": 20000,
-        "total_reward": total_reward,
-    }
+    # results["last_training"] = {
+    #     "timesteps": 20000,
+    #     "total_reward": total_reward,
+    # }
     save_results(results, results_filepath)
-
-    # Zapisanie modelu agenta
-    rl_agent.save_model(model_filepath)
-    logging.info(f"RL agent model saved to {model_filepath}")
 
 
 if __name__ == "__main__":

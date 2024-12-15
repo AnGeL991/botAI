@@ -1,6 +1,3 @@
-# Klient API dla wielu giełd, w tym Bybit
-ccxt==3.0.36    # Obsługuje wiele giełd, w tym Bybit
-
 # Obsługa danych
 pandas==2.1.1   # Analiza i manipulacja danymi
 numpy==1.24.3   # Operacje numeryczne
@@ -18,6 +15,8 @@ scikit-learn==1.2.2  # Jeśli używasz scikit-learn do AI
 pybit==5.7
 gym
 numpy
-pandas
 pybit
 stable-baselines3
+
+matplotlib
+seaborn
