@@ -7,6 +7,7 @@ from stable_baselines3.common.callbacks import EvalCallback
 from services.rl_trading_env import TradingEnv
 import torch
 import re  # Dodaj import na początku pliku
+import random  # Dodaj import na początku pliku
 
 
 logging.basicConfig(filename="trading_bot.log", level=logging.INFO)
@@ -20,13 +21,16 @@ class RLAgent:
         self.window_size = window_size
         self.learning_rate = learning_rate
         self.gamma = gamma
+        self.client = client
 
         # Tworzenie środowiska
-        self.env = TradingEnv(client=client, window_size=window_size, interval="5")
-        self.eval_env = TradingEnv(
-            client=client, window_size=window_size, interval="5"
-        )  # Środowisko do ewaluacji
+        self.env = TradingEnv(client=client, window_size=window_size, interval="15")
 
+        self.eval_env = TradingEnv(
+            client=client,
+            window_size=self.window_size,
+            interval="15",
+        )
         # Tworzenie modelu PPO z Stable-Baselines3
         self.model = PPO(
             "MlpPolicy",
@@ -55,7 +59,7 @@ class RLAgent:
             render=False,
         )
 
-        # Rozpoczęcie treningu
+        # Rozpoczcie treningu
         self.model.learn(total_timesteps=timesteps, callback=eval_callback)
 
         # Po zakończeniu treningu zapisujemy model i wizualizujemy wyniki
@@ -68,8 +72,30 @@ class RLAgent:
         Ewaluacja agenta na podstawie średniego zysku z kilku epizodów.
         """
         total_rewards = []
+        symbols = [
+            "ONDOUSDT",
+        ]  # Lista symboli do wyboru
+
+        # Sprawdzenie, czy liczba epizodów nie przekracza liczby dostępnych symboli
+        if episodes > len(symbols):
+            raise ValueError(
+                "Liczba epizodów nie może przekraczać liczby dostępnych symboli."
+            )
+
+        selected_symbols = random.sample(
+            symbols, episodes
+        )  # Losowy wybór unikalnych symboli
 
         for episode in range(episodes):
+            symbol = selected_symbols[
+                episode
+            ]  # Wybór symbolu z listy unikalnych symboli
+            self.eval_env = TradingEnv(
+                client=self.client,
+                window_size=self.window_size,
+                interval="15",
+                symbol=symbol,
+            )
             obs = self.eval_env.reset()
             done = False
             episode_reward = 0
@@ -81,11 +107,14 @@ class RLAgent:
                 )
                 obs, reward, done, info = self.eval_env.step(action)
                 episode_reward += reward
-                #print(
-                #    f"Action: {action}, Reward: {reward}, Info: {info}"
-                #)  # Dodaj logowanie akcji i nagrody
+                print(
+                    f"Action: {action}, Reward: {reward}, Info: {info}"
+                )  # Dodaj logowanie akcji i nagrody
 
             total_rewards.append(episode_reward)
+            logging.info(
+                f"Episod {episode + 1} z symbolem {symbol}: nagroda {episode_reward}"
+            )
 
         avg_reward = sum(total_rewards) / len(total_rewards)
         self.evaluation_rewards.append(avg_reward)
@@ -161,7 +190,7 @@ class RLAgent:
             elif re.match(r"Close Position", transaction[0]):  # Zamknięcie pozycji long
                 if len(transaction) == 5:  # Sprawdzamy, czy mamy zysk/stratę
                     logging.info(
-                        f"Close Position at {transaction[1]} for quantity {transaction[2]}, "
+                        f"{transaction[0]} at {transaction[1]} for quantity {transaction[2]}, "
                         f"Balance: {transaction[3]}, Profit/Loss: {transaction[4]}"
                     )
                 else:

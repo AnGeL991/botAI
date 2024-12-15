@@ -14,7 +14,7 @@ class TradingEnv(gym.Env):
         client: HTTP,
         window_size=30,
         symbol="ONDOUSDT",
-        interval="5",
+        interval="15",
         limit=1000,
         leverage=50,
         risk_per_trade=0.02,
@@ -145,8 +145,11 @@ class TradingEnv(gym.Env):
                     "current_price": current_price,
                     "balance": self.balance,
                     "position": self.position,
+                    "net_profit": 0,
                 }
-                reward = self.close_position(current_price)
+                res = self.close_position(current_price)
+                reward = res[0]
+                info["net_profit"] = res[1]
         elif action == 2:  # Sprzedaż (short)
             if self.position is None:
 
@@ -162,8 +165,11 @@ class TradingEnv(gym.Env):
                     "current_price": current_price,
                     "balance": self.balance,
                     "position": self.position,
+                    "net_profit": 0,
                 }
-                reward = self.close_position(current_price)
+                res = self.close_position(current_price)
+                reward = res[0]
+                info["net_profit"] = res[1]
         elif action == 0:  # Hold
             if self.position:
                 if (
@@ -183,8 +189,11 @@ class TradingEnv(gym.Env):
                         "message": "Close Position " + self.position["type"],
                         "balance": self.balance,
                         "position": self.position,
+                        "net_profit": 0,
                     }
-                    reward = self.close_position(current_price)
+                    res = self.close_position(current_price)
+                    reward = res[0]
+                    info["net_profit"] = res[1]
                 else:
                     info = {
                         "message": "Hold",
@@ -317,22 +326,37 @@ class TradingEnv(gym.Env):
 
     def close_position(self, current_price, take_profit=False, stop_loss=False):
         """
-        Zamyka otwartą pozycję i oblicza wynik.
+        Zamyka otwartą pozycję i oblicza wynik z uwzględnieniem prowizji.
+        Zwraca procentowy zysk z transakcji.
         """
         if self.position is None:
             return 0
 
-        # Oblicz wynik transakcji
+        # Oblicz podstawowe parametry
         entry_price = self.position["entry_price"]
         quantity = self.position.get("quantity", 0)
+        position_size = entry_price * quantity  # Wielkość pozycji w dolarach
 
+        # Ustawienie stawek prowizji (dostosuj do swoich stawek)
+        fee_rate = 0.0006  # 0.06% dla market takers
+        total_fees = position_size * fee_rate * 2  # Dla otwarcia i zamknięcia pozycji
+
+        # Oblicz wynik brutto
         if self.position["type"] == "long":
             profit = (current_price - entry_price) * quantity
         elif self.position["type"] == "short":
             profit = (entry_price - current_price) * quantity
 
+        # Uwzględnij prowizję w wyniku
+        net_profit = profit - total_fees
+
+        # Oblicz procentowy zysk
+        percentage_profit = (
+            (net_profit / position_size) * 100 if position_size > 0 else 0
+        )
+
         # Aktualizacja balansu
-        self.balance += round(profit, 2)
+        self.balance += round(net_profit, 2)
 
         # Dodanie do historii
         reason = (
@@ -341,7 +365,7 @@ class TradingEnv(gym.Env):
             else (
                 "Stop Loss"
                 if stop_loss
-                else f"Close Position {self.position.get('type')}"
+                else f"Close Position {self.position.get('type')} net profit {net_profit} profit {profit} total fees {total_fees}"
             )
         )
 
@@ -351,14 +375,12 @@ class TradingEnv(gym.Env):
                 current_price,
                 quantity,
                 self.balance,
-                round(profit, 2),
+                round(net_profit, 2),
             )
         )
 
-        # logging.info(f"Closed position: at {current_price} profit {profit}")
-
         self.position = None  # Reset pozycji
-        return profit
+        return percentage_profit, net_profit  # Zwróć procentowy zysk
 
     def _get_observation(self):
         """

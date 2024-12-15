@@ -61,6 +61,7 @@ def main():
     else:
         print("Brak danych rynkowych! Upewnij się, że API zwraca poprawne dane.")
 
+
     # Wczytanie wyników
     results_filepath = "results.json"
     model_filepath = "ppo_model.zip"
