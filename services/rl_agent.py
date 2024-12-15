@@ -108,8 +108,8 @@ class RLAgent:
                 obs, reward, done, info = self.eval_env.step(action)
                 episode_reward += reward
                 print(
-                    f"Action: {action}, Reward: {reward}, Info: {info}"
-                )  # Dodaj logowanie akcji i nagrody
+                  f"Action: {action}, Reward: {reward}, Info: {info}"
+                 )  # Dodaj logowanie akcji i nagrody
 
             total_rewards.append(episode_reward)
             logging.info(
