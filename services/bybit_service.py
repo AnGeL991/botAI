@@ -1,0 +1,287 @@
+import gym
+import numpy as np
+import pandas as pd
+from gym import spaces
+from pybit.unified_trading import HTTP
+import logging
+
+
+logging.basicConfig(level=logging.INFO)
+
+
+class BybitService:
+    def __init__(
+        self,
+        api_key,
+        api_secret,
+        demo=True,
+        stop_loss_ratio=0.02,
+        take_profit_ratio=0.02,
+        risk_per_trade=0.02,
+        leverage=50,
+    ):
+        self.client = HTTP(api_key=api_key, api_secret=api_secret, demo=demo)
+        self.stop_loss_ratio = stop_loss_ratio
+        self.take_profit_ratio = take_profit_ratio
+        self.risk_per_trade = risk_per_trade
+        self.leverage = leverage
+        self.balance = self.get_account_balance()
+        self.data = self.fetch_data()
+
+    def test_connection(self):
+        try:
+            # Sprawdzamy aktualną cenę rynkową
+            self.client.get_tickers(category="linear", symbol="BTCUSDT")
+            print("Connection test successful")
+        except Exception as e:
+            print("Connection test failed:", e)
+
+    def fetch_data(self, symbol="BTCUSDT", interval="5", limit=500):
+        try:
+            data = self.client.get_kline(symbol=symbol, interval=interval, limit=limit)
+
+            if "result" not in data:
+                raise ValueError("Brak wyników w odpowiedzi API.")
+
+            df = pd.DataFrame(data["result"])
+
+            if "list" in df.columns:
+                df = pd.DataFrame(
+                    df["list"].to_list(),
+                    columns=[
+                        "timestamp",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                        "turnover",
+                    ],
+                )
+
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df.set_index("timestamp", inplace=True)
+
+            df = df.astype(
+                {
+                    "open": "float",
+                    "high": "float",
+                    "low": "float",
+                    "close": "float",
+                    "volume": "float",
+                    "turnover": "float",
+                }
+            )
+
+            if df.empty:
+                raise ValueError("Dane z Bybit są puste.")
+
+            if df.isnull().values.any():
+                raise ValueError("Pobrane dane zawierają NaN.")
+
+            return df
+        except Exception as e:
+            print(f"Błąd przy pobieraniu danych: {e}")
+            return pd.DataFrame()
+
+    def message_callback(self, message):
+        """
+        Obsługuje przychodzące wiadomości WebSocket.
+        Dodaje dane do self.data, jeśli 'confirm' jest ustawione na True.
+        """
+        if "data" in message and isinstance(message["data"], list):
+            for item in message["data"]:
+                if item.get("confirm") is True:  # Sprawdzenie, czy 'confirm' jest True
+                    new_row = {
+                        "timestamp": item["timestamp"],
+                        "open": float(item["open"]),
+                        "high": float(item["high"]),
+                        "low": float(item["low"]),
+                        "close": float(item["close"]),
+                        "volume": float(item["volume"]),
+                        "turnover": float(item["turnover"]),
+                    }
+                    # Dodanie nowego wiersza do self.data
+                    self.data = self.data.append(new_row, ignore_index=True)
+                    self.data["timestamp"] = pd.to_datetime(
+                        self.data["timestamp"], unit="ms"
+                    )
+                    self.data.set_index("timestamp", inplace=True)
+                    logging.info(f"Added new data: {new_row}")
+        else:
+            logging.warning("Received message does not contain valid data.")
+
+        print(self.data.head())
+
+    def open_position(
+        self,
+        symbol,
+        side,
+        quantity,
+        current_price=None,
+        leverage=50,
+        stop_loss_price=None,
+        take_profit_price=None,
+    ):
+        """
+        Otwiera pozycję (long/short) na danym symbolu.
+        """
+        try:
+            order = self.client.place_order(
+                category="linear",
+                symbol=symbol,
+                side=side,
+                order_type="Market",
+                qty=quantity,
+                price=current_price,
+                isLeverage=leverage,
+                timeInForce="PostOnly",
+                takeProfit=take_profit_price,
+                stopLoss=stop_loss_price,
+            )
+
+            return order
+        except Exception as e:
+            logging.error(f"Błąd przy otwieraniu pozycji: {e}")
+            return None
+
+    def close_position(self, symbol, side, quantity, price):
+        """
+        Zamyka otwartą pozycję na danym symbolu.
+        """
+        try:
+            order = self.client.place_order(
+                category="linear",
+                symbol=symbol,
+                side=side,
+                order_type="Market",
+                qty=quantity,
+                price=price,
+            )
+            return order
+        except Exception as e:
+            logging.error(f"Błąd przy zamykaniu pozycji: {e}")
+            return None
+
+    def get_account_balance(self):
+        """
+        Zwraca saldo konta.
+        """
+        try:
+            balance_info = self.client.get_wallet_balance(
+                accountType="UNIFIED",
+                coin="USDT",
+            )
+            return balance_info
+        except Exception as e:
+            logging.error(f"Błąd przy pobieraniu salda konta: {e}")
+            return None
+
+    def get_open_positions(self, symbol):
+        """
+        Zwraca otwarte pozycje dla danego symbolu.
+        """
+        try:
+            positions = self.client.get_open_orders(symbol=symbol)
+            return positions
+        except Exception as e:
+            logging.error(f"Błąd przy pobieraniu otwartych pozycji: {e}")
+            return None
+
+    def get_orders(self, symbol):
+        """
+        Pobiera listę zamówień dla danego symbolu.
+        """
+        try:
+            orders = self.client.get_open_orders(
+                category="linear", limit=1, symbol=symbol
+            )
+            if "result" not in orders:
+                raise ValueError("Brak wyników w odpowiedzi API.")
+
+            logging.info(f"Pobrano zamówienia dla symbolu {symbol}: {orders['result']}")
+            return orders["result"]
+        except Exception as e:
+            logging.error(f"Błąd przy pobieraniu zamówień dla symbolu {symbol}: {e}")
+            return None
+
+    def get_current_price(self, symbol):
+        """
+        Zwraca bieżącą cenę rynkową dla danego symbolu.
+        """
+        ticker = self.client.get_tickers(category="linear", symbol=symbol)
+        print(ticker)
+        return float(ticker["result"]["list"][0]["lastPrice"])
+
+    def calculate_take_profit(self, current_price, position_type):
+        """
+        Oblicza poziom take profit w zależności od rodzaju pozycji.
+        """
+        if position_type == "Buy":
+            return current_price * (1 + self.take_profit_ratio)
+        elif position_type == "Sell":
+            return current_price * (1 - self.take_profit_ratio)
+        else:
+            raise ValueError(f"Nieznany typ pozycji: {position_type}")
+
+    def calculate_stop_loss(self, current_price, stop_loss_distance, position_type):
+        """
+        Oblicza poziom stop loss w zależności od rodzaju pozycji.
+        """
+        if position_type == "Buy":
+            return current_price - stop_loss_distance
+        elif position_type == "Sell":
+            return current_price + stop_loss_distance
+        else:
+            raise ValueError(f"Nieznany typ pozycji: {position_type}")
+
+    def calculate_stop_loss_distance(self, current_price, position_type):
+        """
+        Oblicza odległość stop lossa od ceny wejścia w zależności od rodzaju pozycji.
+        """
+        current_price = float(current_price)
+        if current_price == 0:
+            return 0
+        elif position_type == "Buy":
+            return current_price * self.stop_loss_ratio
+        elif position_type == "Sell":
+            return current_price * self.stop_loss_ratio
+        else:
+            raise ValueError(f"Nieznany typ pozycji: {position_type}")
+
+    def calculate_quantity_and_risk(self, current_price):
+        """
+        Oblicza liczbę kontraktów do otwarcia na podstawie kapitału, dźwigni i poziomu ryzyka.
+        """
+        if current_price == 0:
+            raise ValueError("Current price cannot be zero.")
+
+        max_risk = self.balance * self.risk_per_trade  # Maksymalna strata w USD
+
+        quantity = (max_risk / (self.stop_loss_ratio * current_price)) * self.leverage
+
+        # Logowanie wartości
+        logging.info(
+            f"Current Price: {current_price}, Max Risk: {max_risk}, Quantity: {quantity}"
+        )
+
+        return quantity, max_risk
+
+    def calculate_position_size(
+        self, balance, risk_per_trade, stop_loss_distance, value_per_unit
+    ):
+        """
+        Oblicza maksymalną wielkość pozycji na podstawie balansu, ryzyka, i stop lossa.
+        """
+        max_loss = balance * risk_per_trade
+
+        if stop_loss_distance <= 0 or value_per_unit <= 0:
+            raise ValueError(
+                "stop_loss_distance i value_per_unit muszą być większe od zera."
+            )
+
+        position_size = max_loss / (stop_loss_distance * value_per_unit)
+        return round(position_size, 0)
+
+    def get_shares(self):
+        return self.shares
