@@ -2,11 +2,14 @@ from pybit.unified_trading import HTTP
 from config.settings import API_KEY, API_SECRET
 from services.data_service import DataService
 from services.trading_service import TradingService
-from services.ai_service import AIStrategy
-from services.backtest_service import Backtester
+
 from services.rl_agent import RLAgent
 import logging
 import json
+from services.bybit_service import BybitService
+from services.websocket_service import BybitWebSocketService
+import time
+import threading
 
 logging.basicConfig(filename="trading_bot.log", level=logging.INFO)
 
@@ -41,31 +44,25 @@ def save_results(results, filepath="results.json"):
 
 
 def main():
-    # Inicjalizacja serwisów, klient jest przekazywany jako zależność
-    data_service = DataService(client)
-    trading_service = TradingService(client)
-
-    # Test połączenia z API Bybit
-    data_service.test_connection()
+    # Inicjowanie serwisu Bybit
+    bybit_service = BybitService(API_KEY, API_SECRET)
 
     # Dodanie agenta RL
-    rl_agent = RLAgent(client)
+    rl_agent = RLAgent(client, bybit_service, window_size=60)
 
-    # Pobranie danych i wyświetlenie ich raz
     logging.info("Fetching market data for the agent...")
     env_data = rl_agent.env.data  # Pobranie danych z środowiska agenta
 
     if env_data is not None and not env_data.empty:
         print("Dane rynkowe używane przez agenta:")
         print(env_data.head())  # Wyświetlenie pierwszych wierszy danych
+
     else:
         print("Brak danych rynkowych! Upewnij się, że API zwraca poprawne dane.")
 
-
     # Wczytanie wyników
-    results_filepath = "results.json"
-    model_filepath = "ppo_model.zip"
-    results = load_results(results_filepath)
+
+    model_filepath = "./logs/best_model.zip"
 
     # Sprawdzenie, czy istnieje zapisany model
     try:
@@ -74,20 +71,49 @@ def main():
         logging.warning("Model file not found. Starting with a new model.")
 
     # Trening agenta
-    logging.info("Starting RL agent training...")
-    rl_agent.train(timesteps=20000)
-    logging.info("RL agent training complete.")
+    #logging.info("Starting RL agent training...")
+    #results = []
+    #total_steps = 43  # Ustal maksymalną liczbę kroków, np. 10
+    #for step in range(1, total_steps + 1):
+    #    logging.info(f"Training step: {step}")
+    #    rl_agent.load_model(model_filepath)
+    #    rl_agent.train_on_file_data(timesteps=200000, eval_freq=25000, step=step)
+    #    total_reward = rl_agent.evaluate()
+    #    logging.info(f"RL agent evaluation total reward: {total_reward}")
+    #    results.append(
+    #        {
+    #            "step": step,
+    #            "total_reward": total_reward,
+    #        }
+    #    )
+    # save_results(results)
+    # logging.info("RL agent training complete.")
 
-    # Ewaluacja agenta
-    total_reward = rl_agent.evaluate()
+    # rl_agent.eval_env.set_new_data(43)
+    total_reward = rl_agent.real_time_evaluate()
+
     logging.info(f"RL agent evaluation total reward: {total_reward}")
 
-    # Aktualizacja wyników
-    # results["last_training"] = {
-    #     "timesteps": 20000,
-    #     "total_reward": total_reward,
-    # }
-    save_results(results, results_filepath)
+    # total_reward = rl_agent.evaluate()
+    # logging.info(f"RL agent evaluation total reward: {total_reward}")
+
+
+#  results.append(
+#   {
+#       "step": step,
+#       "total_reward": total_reward,
+#   }
+#  )
+
+
+# if __name__ == "__main__":
+#   step = 0
+#  results_filepath = "results.json"
+#  results = []
+#
+# for _ in range(50):
+#   main(results, step)
+#     step += 1
 
 
 if __name__ == "__main__":

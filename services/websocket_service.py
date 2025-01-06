@@ -34,7 +34,7 @@ class BybitWebSocketService:
             try:
                 self.ws = WebSocket(channel_type="linear", testnet=False)
                 # Sprawdzenie, czy subskrypcja jest poprawna
-                self.ws.kline_stream("1", self.symbol, self.on_message_callback)
+                self.ws.kline_stream("5", self.symbol, self.on_message_callback)
                 logging.info(f"WebSocket connected for symbol: {self.symbol}")
 
                 # Pozostawienie połączenia aktywnego
@@ -68,6 +68,9 @@ class BybitWebSocketService:
             self.thread.join()
         self._close_websocket()
         logging.info("WebSocket service stopped.")
+
+    def is_running(self):
+        return self.running
 
 
 # Przykładowa funkcja callback do obsługi wiadomości

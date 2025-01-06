@@ -20,3 +20,4 @@ stable-baselines3
 
 matplotlib
 seaborn
+requests
