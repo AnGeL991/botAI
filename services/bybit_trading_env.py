@@ -23,6 +23,7 @@ class BybitTradingEnv(gym.Env):
         risk_per_trade=0.02,
         take_profit_ratio=0.05,
         stop_loss_ratio=0.02,
+        current_step=0,
     ):
         super(BybitTradingEnv, self).__init__()
 
@@ -43,6 +44,8 @@ class BybitTradingEnv(gym.Env):
         self.limit = limit
         self.leverage = leverage
 
+        self.is_real_time = False
+        
         # Zarządzanie ryzykiem
         self.risk_per_trade = risk_per_trade
         self.take_profit_ratio = take_profit_ratio
@@ -56,8 +59,8 @@ class BybitTradingEnv(gym.Env):
 
         # Dane rynkowe i stan
         self.data = self.bybit_service.fetch_data(symbol, interval, limit)
-        self.new_data_received = False
-        self.current_step = 999
+        self.new_data_received = True
+        self.current_step = current_step
         self.balance = 1000
         self.position = (
             None  # Pozycja: {"type": "long", "entry_price": float, "quantity": float}
@@ -68,11 +71,17 @@ class BybitTradingEnv(gym.Env):
         self.websocket_service = BybitWebSocketService(
             symbol=self.symbol, on_message_callback=self.message_callback
         )
+
         try:
             self.websocket_service.start()
         except KeyboardInterrupt:
             logging.info("Shutting down...")
             self.websocket_service.stop()
+
+    def start_websocket(self):
+        if not self.websocket_service.is_running():
+            self.websocket_service.start()
+            logging.info("WebSocket started successfully.")
 
     def message_callback(self, message):
         """
@@ -91,18 +100,23 @@ class BybitTradingEnv(gym.Env):
                         "volume": float(item["volume"]),
                         "turnover": float(item["turnover"]),
                     }
+
                     # Dodanie nowego wiersza do self.data
                     new_row_df = pd.DataFrame(
                         [new_row]
                     )  # Tworzenie DataFrame z nowego wiersza
+
                     self.data = pd.concat(
                         [self.data, new_row_df], ignore_index=True
                     )  # Użycie pd.concat zamiast append
+
                     self.data["timestamp"] = pd.to_datetime(
                         self.data["timestamp"], unit="ms"
                     )
+
                     self.data.set_index("timestamp", inplace=True)
                     self.new_data_received = True
+
                     logging.info(f"Added new data: {new_row}")
         else:
             logging.warning("Received message does not contain valid data.")
@@ -111,6 +125,14 @@ class BybitTradingEnv(gym.Env):
         """Zatrzymuje działanie serwisu WebSocket i środowiska."""
         self.websocket_service.stop()  # Zatrzymanie WebSocket
         logging.info("BybitTradingEnv stopped.")
+
+    def reset(self):
+        self.balance = 1000
+        self.position = None
+        self.current_step = self.window_size
+        self.transaction_history = []
+        self.new_data_received = False
+        return self._get_observation()
 
     def add_data(self, data):
         self.data = data
@@ -138,24 +160,25 @@ class BybitTradingEnv(gym.Env):
         Wykonanie akcji w środowisku.
         """
         assert self.action_space.contains(action), f"Nieprawidłowa akcja: {action}"
-        print("data", len(self.data), self.new_data_received)
-        if self.new_data_received:
+
+        print(f"current_step: {self.current_step} len(self.data): {len(self.data)}")
+        if not self.is_real_time:
+            self.is_real_time = self.current_step == len(self.data)
+
+        if self.new_data_received and self.is_real_time:
             self.new_data_received = False
 
         # Aktualizacja stanu środowiska
         self.current_step += 1
-
+        print(f"current_step: {self.current_step}")
         current_price = self.bybit_service.get_current_price(self.symbol)
         logging.info(f"Bieżąca cena: {current_price}")
 
-        # Dodaj logowanie, aby sprawdzić, czy current_price jest poprawne
-        if current_price is None or not isinstance(current_price, (int, float)):
-            logging.error("Bieżąca cena jest None lub nie jest typu numerycznego.")
-        elif np.isnan(current_price):
-            logging.error("Bieżąca cena jest NaN.")
-
         reward = 0
         info = {}
+        done = False
+
+        reward = self.get_profit_or_loss(current_price)
 
         # Logika akcji
         if action == 1:  # Kupno (long)
@@ -175,7 +198,9 @@ class BybitTradingEnv(gym.Env):
                     "position": self.position,
                     "net_profit": 0,
                 }
+
                 res = self.close_position(current_price, "Buy")
+
                 reward = res[0]
                 info["net_profit"] = res[1]
         elif action == 2:  # Sprzedaż (short)
@@ -195,7 +220,9 @@ class BybitTradingEnv(gym.Env):
                     "position": self.position,
                     "net_profit": 0,
                 }
+
                 res = self.close_position(current_price, "Sell")
+
                 reward = res[0]
                 info["net_profit"] = res[1]
         elif action == 0:  # Hold
@@ -227,7 +254,7 @@ class BybitTradingEnv(gym.Env):
                 f"Current position: balance {self.balance} position {self.position}"
             )
 
-        return observation, reward, info
+        return observation, reward, done, info
 
     def open_position(self, current_price, position_type):
         """
@@ -236,6 +263,7 @@ class BybitTradingEnv(gym.Env):
         stop_loss_distance = self.bybit_service.calculate_stop_loss_distance(
             current_price, position_type
         )
+
         if stop_loss_distance == 0:
             raise ValueError("Stop loss distance cannot be zero.")
 
@@ -246,7 +274,7 @@ class BybitTradingEnv(gym.Env):
             stop_loss_distance=stop_loss_distance,
             value_per_unit=current_price,
         )
-        print(f"Position size: {position_size}")
+
         # Walidacja pozycji
         if position_size <= 0:
             logging.error(f"Invalid position size: {position_size}")
@@ -267,15 +295,15 @@ class BybitTradingEnv(gym.Env):
             "stop_loss": stop_loss,
             "take_profit": take_profit,
         }
-
-        self.bybit_service.open_position(
-            symbol=self.symbol,
-            side=position_type,
-            quantity=position_size,
-            current_price=current_price,
-            stop_loss_price=stop_loss,
-            take_profit_price=take_profit,
-        )
+        if self.is_real_time:
+            self.bybit_service.open_position(
+                symbol=self.symbol,
+                side=position_type,
+                quantity=position_size,
+                current_price=current_price,
+                stop_loss_price=stop_loss,
+                take_profit_price=take_profit,
+            )
         logging.info(f"Opened position: {self.position}")
 
         self.transaction_history.append(
@@ -325,12 +353,13 @@ class BybitTradingEnv(gym.Env):
         # Aktualizacja balansu
         self.balance += round(net_profit, 2)
 
-        self.bybit_service.close_position(
-            symbol=self.symbol,
-            side=position_type,
-            quantity=self.position["quantity"],
-            price=current_price,
-        )
+        if self.is_real_time:
+            self.bybit_service.close_position(
+                symbol=self.symbol,
+                side=position_type,
+                quantity=self.position["quantity"],
+                price=current_price,
+            )
 
         # Dodanie do historii
         reason = (
@@ -357,6 +386,63 @@ class BybitTradingEnv(gym.Env):
         self.position = None  # Reset pozycji
         return percentage_profit, net_profit  # Zwróć procentowy zysk
 
+    def get_profit_or_loss(self, current_price):
+
+        if self.position is None:
+            return 0
+        elif (
+            self.position
+            and self.position["type"] == "Buy"
+            and (current_price >= self.position["take_profit"])
+        ) or (
+            self.position
+            and self.position["type"] == "Sell"
+            and (current_price <= self.position["take_profit"])
+        ):
+            position_type = "Sell" if self.position["type"] == "Buy" else "Buy"
+            info = {
+                "message": "Close Position with take profit" + self.position["type"],
+                "balance": self.balance,
+                "position": self.position,
+                "net_profit": 0,
+            }
+            res = self.close_position(
+                self.position["take_profit"],
+                position_type,
+                take_profit=True,
+            )
+            reward = res[0]
+            info["net_profit"] = res[1]
+            self.position = None
+            return reward
+        elif (
+            self.position
+            and self.position["type"] == "Buy"
+            and (current_price <= self.position["stop_loss"])
+        ) or (
+            self.position
+            and self.position["type"] == "Sell"
+            and (current_price >= self.position["stop_loss"])
+        ):
+            info = {
+                "message": "Close Position with stop loss" + self.position["type"],
+                "balance": self.balance,
+                "position": self.position,
+                "net_profit": 0,
+            }
+            position_type = "Sell" if self.position["type"] == "Buy" else "Buy"
+            res = self.close_position(
+                self.position["stop_loss"],
+                position_type,
+                stop_loss=True,
+            )
+            reward = res[0]
+            info["net_profit"] = res[1]
+            self.position = None
+            return reward
+        else:
+            return 0
+
     def _get_observation(self):
         """
         Zwraca obserwację złożoną z ostatnich window_size kroków.
@@ -375,11 +461,6 @@ class BybitTradingEnv(gym.Env):
             window_data = self.data.iloc[
                 self.current_step - self.window_size : self.current_step
             ][["open", "high", "low", "close", "volume"]].values
-
-        # Upewnij się, że kształt jest zawsze (window_size, 5)
-        if window_data.shape[0] < self.window_size:
-            padding = self.window_size - window_data.shape[0]
-            window_data = np.vstack([np.zeros((padding, 5)), window_data])
 
         return window_data
 

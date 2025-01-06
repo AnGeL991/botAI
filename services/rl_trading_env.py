@@ -4,6 +4,8 @@ import pandas as pd
 from gym import spaces
 from pybit.unified_trading import HTTP
 import logging
+from services.bybit_service import BybitService
+from services.websocket_service import BybitWebSocketService
 
 logging.basicConfig(level=logging.INFO)
 
@@ -11,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 class TradingEnv(gym.Env):
     def __init__(
         self,
-        client: HTTP,
+        bybit_service: BybitService,
         window_size=30,
         symbol="ONDOUSDT",
         interval="15",
@@ -20,16 +22,18 @@ class TradingEnv(gym.Env):
         risk_per_trade=0.02,
         take_profit_ratio=0.05,
         stop_loss_ratio=0.02,
+        take_data_from_file=False,
     ):
         super(TradingEnv, self).__init__()
 
         # Ustawienia
-        self.client = client
+        self.bybit_service = bybit_service
         self.symbol = symbol
         self.interval = interval  # Interwał ustawiony na 5 minut
         self.window_size = window_size  # Rozmiar okna dla scalpingu
         self.limit = limit
         self.leverage = leverage  # Dźwignia (lewarowanie)
+        self.is_real_time = False
 
         # Zarządzanie ryzykiem
         self.risk_per_trade = risk_per_trade  # Ryzyko na transakcję jako % kapitału
@@ -44,74 +48,85 @@ class TradingEnv(gym.Env):
 
         # Dane rynkowe i stan
         self.data = None
-        self.current_step = 0
+        self.new_data_received = True
+        self.current_step =997
         self.balance = 1000  # Początkowy kapitał w USD
         self.position = (
             None  # Pozycja: {"type": "long", "entry_price": float, "quantity": float}
         )
         self.transaction_history = []
 
-        self.data = self.fetch_data()  # Pobieranie danych z Bybit
+        # Inicjalizacja WebSocket
+        self.websocket_service = BybitWebSocketService(
+            symbol=self.symbol, on_message_callback=self.message_callback
+        )
 
-    def fetch_data(self):
+        if take_data_from_file:
+            self.data = self.bybit_service.fetch_data_from_file("bybit_data.json", 1)
+        else:
+            self.data = self.bybit_service.fetch_data(
+                self.symbol, self.interval, self.limit
+            )  # Pobieranie danych z Bybit
+
         try:
-            data = self.client.get_kline(
-                symbol=self.symbol, interval=self.interval, limit=self.limit
-            )
+            self.websocket_service.start()
+        except KeyboardInterrupt:
+            logging.info("Shutting down...")
+            self.websocket_service.stop()
 
-            if "result" not in data:
-                raise ValueError("Brak wyników w odpowiedzi API.")
+    def start_websocket(self):
+        if not self.websocket_service.is_running():
+            self.websocket_service.start()
+            logging.info("WebSocket started successfully.")
 
-            df = pd.DataFrame(data["result"])
+    def message_callback(self, message):
+        """
+        Obsługuje przychodzące wiadomości WebSocket.
+        Dodaje dane do self.data, jeśli 'confirm' jest ustawione na True.
+        """
+        if "data" in message and isinstance(message["data"], list):
+            for item in message["data"]:
+                if item.get("confirm") is True:  # Sprawdzenie, czy 'confirm' jest True
+                    new_row = {
+                        "timestamp": item["timestamp"],
+                        "open": float(item["open"]),
+                        "high": float(item["high"]),
+                        "low": float(item["low"]),
+                        "close": float(item["close"]),
+                        "volume": float(item["volume"]),
+                        "turnover": float(item["turnover"]),
+                    }
 
-            if "list" in df.columns:
-                df = pd.DataFrame(
-                    df["list"].to_list(),
-                    columns=[
-                        "timestamp",
-                        "open",
-                        "high",
-                        "low",
-                        "close",
-                        "volume",
-                        "turnover",
-                    ],
-                )
+                    # Dodanie nowego wiersza do self.data
+                    new_row_df = pd.DataFrame(
+                        [new_row]
+                    )  # Tworzenie DataFrame z nowego wiersza
 
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-            df.set_index("timestamp", inplace=True)
+                    self.data = pd.concat(
+                        [self.data, new_row_df], ignore_index=True
+                    )  # Użycie pd.concat zamiast append
 
-            df = df.astype(
-                {
-                    "open": "float",
-                    "high": "float",
-                    "low": "float",
-                    "close": "float",
-                    "volume": "float",
-                    "turnover": "float",
-                }
-            )
+                    self.data["timestamp"] = pd.to_datetime(
+                        self.data["timestamp"], unit="ms"
+                    )
 
-            if df.empty:
-                raise ValueError("Dane z Bybit są puste.")
+                    self.data.set_index("timestamp", inplace=True)
+                    self.new_data_received = True
 
-            if df.isnull().values.any():
-                raise ValueError("Pobrane dane zawierają NaN.")
+                    logging.info(f"Added new data: {new_row}")
+        else:
+            logging.warning("Received message does not contain valid data.")
 
-            return df
-        except Exception as e:
-            print(f"Błąd przy pobieraniu danych: {e}")
-            return pd.DataFrame()  # Zwróć pusty DataFrame w przypadku błędu
+    def set_new_data(self, step):
+        self.data = self.bybit_service.fetch_data_from_file("bybit_data.json", step)
 
     def reset(self):
         self.balance = 1000
-        self.shares = 0
-        self.margin = 0
-        self.entry_price = 0
-        self.buy_price = None  # Cena zakupu
         self.current_step = self.window_size  # Ustawienie kroku początkowego dla okna
         self.transaction_history = []  # Resetowanie historii transakcji
         self.position = None
+        self.new_data_received = True
+        self.is_real_time = False
         return self._get_observation()
 
     def step(self, action):
@@ -120,26 +135,35 @@ class TradingEnv(gym.Env):
         """
         assert self.action_space.contains(action), f"Nieprawidłowa akcja: {action}"
 
+        if self.new_data_received and self.is_real_time:
+            self.new_data_received = False
+
         # Aktualizacja stanu środowiska
         self.current_step += 1
-        done = self.current_step >= len(self.data) - 1
-
+        #done = self.current_step >= len(self.data) - 1
+        done = False
         current_price = self.get_current_price()
         # logging.info(f"Bieżąca cena: {current_price}")  # Logowanie bieżącej ceny
         reward = 0
         info = {}
 
+        reward, info = self.get_profit_or_loss(current_price)
+        observation = self._get_observation()
+
+        if reward > 0:
+            return observation, reward, done, info
+
         # Logika akcji
         if action == 1:  # Kupno (long)
             if self.position is None:
 
-                self.open_position(current_price, position_type="long")
+                self.open_position(current_price, position_type="Buy")
                 info = {
                     "message": "Open Long",
                     "current_price": current_price,
                     "position": self.position,
                 }
-            elif self.position and self.position["type"] == "short":
+            elif self.position and self.position["type"] == "Sell":
                 info = {
                     "message": "Close Position " + self.position["type"],
                     "current_price": current_price,
@@ -147,19 +171,19 @@ class TradingEnv(gym.Env):
                     "position": self.position,
                     "net_profit": 0,
                 }
-                res = self.close_position(current_price)
+                res = self.close_position(current_price, position_type="Buy")
                 reward = res[0]
                 info["net_profit"] = res[1]
         elif action == 2:  # Sprzedaż (short)
             if self.position is None:
 
-                self.open_position(current_price, position_type="short")
+                self.open_position(current_price, position_type="Sell")
                 info = {
                     "message": "Open Short",
                     "current_price": current_price,
                     "position": self.position,
                 }
-            elif self.position and self.position["type"] == "long":
+            elif self.position and self.position["type"] == "Buy":
                 info = {
                     "message": "Close Position " + self.position["type"],
                     "current_price": current_price,
@@ -167,40 +191,23 @@ class TradingEnv(gym.Env):
                     "position": self.position,
                     "net_profit": 0,
                 }
-                res = self.close_position(current_price)
+                res = self.close_position(current_price, position_type="Sell")
                 reward = res[0]
                 info["net_profit"] = res[1]
+
         elif action == 0:  # Hold
-            if self.position:
-                if (
-                    self.position["type"] == "long"
-                    and (
-                        current_price >= self.position["take_profit"]
-                        or current_price <= self.position["stop_loss"]
-                    )
-                ) or (
-                    self.position["type"] == "short"
-                    and (
-                        current_price <= self.position["take_profit"]
-                        or current_price >= self.position["stop_loss"]
-                    )
-                ):
-                    info = {
-                        "message": "Close Position " + self.position["type"],
-                        "balance": self.balance,
-                        "position": self.position,
-                        "net_profit": 0,
-                    }
-                    res = self.close_position(current_price)
-                    reward = res[0]
-                    info["net_profit"] = res[1]
-                else:
-                    info = {
-                        "message": "Hold",
-                        "current_price": current_price,
-                        "entry_price": self.position["entry_price"],
-                        "position": self.position,
-                    }
+            if self.position is not None:
+                info = {
+                    "message": "Hold",
+                    "current_price": current_price,
+                    "entry_price": self.position["entry_price"],
+                    "position": self.position,
+                }
+            else:
+                info = {
+                    "message": "Hold",
+                    "current_price": current_price,
+                }
 
         # Logowanie nagrody
         if np.isnan(reward):
@@ -212,8 +219,6 @@ class TradingEnv(gym.Env):
         if np.isnan(current_price):
             logging.error(f"Current price is NaN at step: {self.current_step}")
 
-        observation = self._get_observation()
-
         # Logowanie obserwacji
         if np.isnan(observation).any():
             logging.error(
@@ -222,75 +227,34 @@ class TradingEnv(gym.Env):
 
         # Logowanie wartości w self.position
         # if self.position is not None:
-        #  logging.info(
-        #      f"Current position: balance {self.balance} position {self.position}"
-        # )
+        #   logging.info(
+        #       f"Current position: balance {self.balance} position {self.position}"
+        #  )
+
+        # print(f"self.data: {len(self.data)} {self.current_step == 998}")
+
+        if not self.is_real_time and self.current_step >= 997:
+            self.is_real_time = True
+            self.position = None
+            self.balance = 1000
 
         return observation, reward, done, info
-
-    def calculate_quantity_and_risk(self, current_price):
-        """
-        Oblicza liczbę kontraktów do otwarcia na podstawie kapitału, dźwigni i poziomu ryzyka.
-        """
-        if current_price == 0:
-            raise ValueError("Current price cannot be zero.")
-
-        max_risk = self.balance * self.risk_per_trade  # Maksymalna strata w USD
-
-        quantity = (max_risk / (self.stop_loss_ratio * current_price)) * self.leverage
-
-        # Logowanie wartości
-        logging.info(
-            f"Current Price: {current_price}, Max Risk: {max_risk}, Quantity: {quantity}"
-        )
-
-        return quantity, max_risk
-
-    def calculate_position_size(
-        self, balance, risk_per_trade, leverage, stop_loss_distance, value_per_unit
-    ):
-        """
-        Oblicza maksymalną wielkość pozycji na podstawie balansu, ryzyka, dźwigni i stop lossa.
-        """
-        # 1. Maksymalna strata, którą akceptujemy
-        max_loss = balance * risk_per_trade  # np. 2% z balansu
-
-        # Logowanie wartości wejściowych
-        # logging.info(
-        #    f"Balance: {balance}, Risk per trade: {risk_per_trade}, "
-        #    f"Leverage: {leverage}, Stop loss distance: {stop_loss_distance}, "
-        #     f"Value per unit: {value_per_unit}"
-        # )
-
-        # 2. Sprawdzenie, czy stop_loss_distance i value_per_unit są różne od zera
-        if stop_loss_distance <= 0 or value_per_unit <= 0:
-            raise ValueError(
-                "stop_loss_distance i value_per_unit muszą być większe od zera."
-            )
-
-        # 3. Obliczenie wielkości pozycji
-        position_size = max_loss / (stop_loss_distance * value_per_unit)
-
-        # Logowanie obliczonej wielkości pozycji
-        # logging.info(f"Calculated position size: {position_size}")
-
-        return round(position_size, 2)
 
     def open_position(self, current_price, position_type):
         """
         Otwieranie pozycji (long/short) z uwzględnieniem wielkości pozycji na podstawie ryzyka.
         """
-        stop_loss_distance = self.calculate_stop_loss_distance(
+        stop_loss_distance = self.bybit_service.calculate_stop_loss_distance(
             current_price, position_type
         )
+
         if stop_loss_distance == 0:
             raise ValueError("Stop loss distance cannot be zero.")
 
         # Oblicz wielkość pozycji
-        position_size = self.calculate_position_size(
+        position_size = self.bybit_service.calculate_position_size(
             balance=self.balance,
             risk_per_trade=self.risk_per_trade,
-            leverage=self.leverage,
             stop_loss_distance=stop_loss_distance,
             value_per_unit=current_price,
         )
@@ -300,17 +264,30 @@ class TradingEnv(gym.Env):
             logging.error(f"Invalid position size: {position_size}")
             raise ValueError("Position size must be greater than zero.")
 
+        stop_loss = self.bybit_service.calculate_stop_loss(
+            current_price, stop_loss_distance, position_type
+        )
+        take_profit = self.bybit_service.calculate_take_profit(
+            current_price, position_type
+        )
+
         # Aktualizacja pozycji
         self.position = {
             "type": position_type,
             "quantity": position_size,
             "entry_price": current_price,
-            "stop_loss": self.calculate_stop_loss(
-                current_price, stop_loss_distance, position_type
-            ),
-            "take_profit": self.calculate_take_profit(current_price, position_type),
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
         }
-
+        if self.is_real_time and self.current_step >= 999:
+            self.bybit_service.open_position(
+                symbol=self.symbol,
+                side=position_type,
+                quantity=position_size,
+                current_price=current_price,
+                stop_loss_price=stop_loss,
+                take_profit_price=take_profit,
+            )
         # logging.info(f"Opened position: {self.position}")
 
         self.transaction_history.append(
@@ -324,7 +301,9 @@ class TradingEnv(gym.Env):
 
         return position_size
 
-    def close_position(self, current_price, take_profit=False, stop_loss=False):
+    def close_position(
+        self, current_price, position_type, take_profit=False, stop_loss=False
+    ):
         """
         Zamyka otwartą pozycję i oblicza wynik z uwzględnieniem prowizji.
         Zwraca procentowy zysk z transakcji.
@@ -342,9 +321,9 @@ class TradingEnv(gym.Env):
         total_fees = position_size * fee_rate * 2  # Dla otwarcia i zamknięcia pozycji
 
         # Oblicz wynik brutto
-        if self.position["type"] == "long":
+        if self.position["type"] == "Buy":
             profit = (current_price - entry_price) * quantity
-        elif self.position["type"] == "short":
+        elif self.position["type"] == "Sell":
             profit = (entry_price - current_price) * quantity
 
         # Uwzględnij prowizję w wyniku
@@ -358,16 +337,21 @@ class TradingEnv(gym.Env):
         # Aktualizacja balansu
         self.balance += round(net_profit, 2)
 
-        # Dodanie do historii
-        reason = (
-            "Take Profit"
-            if take_profit
-            else (
-                "Stop Loss"
-                if stop_loss
-                else f"Close Position {self.position.get('type')} net profit {net_profit} profit {profit} total fees {total_fees}"
+        if self.is_real_time and self.current_step >= 999:
+            self.bybit_service.close_position(
+                symbol=self.symbol,
+                side=position_type,
+                quantity=self.position["quantity"],
+                price=current_price,
             )
-        )
+
+        # Dodanie do historii
+        if stop_loss:
+            reason = f"Stop loss {self.position.get('type')} net profit {net_profit} profit {profit} total fees {total_fees}"
+        elif take_profit:
+            reason = f"Take profit {self.position.get('type')} net profit {net_profit} profit {profit} total fees {total_fees}"
+        else:
+            reason = f"Close Position {self.position.get('type')} net profit {net_profit} profit {profit} total fees {total_fees}"
 
         self.transaction_history.append(
             (
@@ -381,6 +365,59 @@ class TradingEnv(gym.Env):
 
         self.position = None  # Reset pozycji
         return percentage_profit, net_profit  # Zwróć procentowy zysk
+
+    def get_profit_or_loss(self, current_price):
+        info = {}
+        if self.position is None:
+            return 0, info
+        elif (
+            self.position
+            and self.position["type"] == "Buy"
+            and (current_price >= self.position["take_profit"])
+        ) or (
+            self.position
+            and self.position["type"] == "Sell"
+            and (current_price <= self.position["take_profit"])
+        ):
+            position_type = "Sell" if self.position["type"] == "Buy" else "Buy"
+            info = {
+                "message": "Close Position with take profit" + self.position["type"],
+                "balance": self.balance,
+                "position": self.position,
+                "net_profit": 0,
+            }
+            res = self.close_position(
+                self.position["take_profit"], position_type, take_profit=True
+            )
+            reward = res[0]
+            info["net_profit"] = res[1]
+            self.position = None
+            return reward, info
+        elif (
+            self.position
+            and self.position["type"] == "Buy"
+            and (current_price <= self.position["stop_loss"])
+        ) or (
+            self.position
+            and self.position["type"] == "Sell"
+            and (current_price >= self.position["stop_loss"])
+        ):
+            position_type = "Sell" if self.position["type"] == "Buy" else "Buy"
+            info = {
+                "message": "Close Position with stop loss" + self.position["type"],
+                "balance": self.balance,
+                "position": self.position,
+                "net_profit": 0,
+            }
+            res = self.close_position(
+                self.position["stop_loss"], position_type, stop_loss=True
+            )
+            reward = res[0]
+            info["net_profit"] = res[1]
+            self.position = None
+            return reward, info
+        else:
+            return 0, info
 
     def _get_observation(self):
         """
@@ -402,41 +439,6 @@ class TradingEnv(gym.Env):
             ][["open", "high", "low", "close", "volume"]].values
 
         return window_data
-
-    def calculate_take_profit(self, current_price, position_type):
-        """
-        Oblicza poziom take profit w zależności od rodzaju pozycji.
-        """
-        if position_type == "long":
-            return current_price * (1 + self.take_profit_ratio)
-        elif position_type == "short":
-            return current_price * (1 - self.take_profit_ratio)
-        else:
-            raise ValueError(f"Nieznany typ pozycji: {position_type}")
-
-    def calculate_stop_loss(self, current_price, stop_loss_distance, position_type):
-        """
-        Oblicza poziom stop loss w zależności od rodzaju pozycji.
-        """
-        if position_type == "long":
-            return current_price - stop_loss_distance
-        elif position_type == "short":
-            return current_price + stop_loss_distance
-        else:
-            raise ValueError(f"Nieznany typ pozycji: {position_type}")
-
-    def calculate_stop_loss_distance(self, current_price, position_type):
-        """
-        Oblicza odległość stop lossa od ceny wejścia w zależności od rodzaju pozycji.
-        """
-        if current_price == 0:
-            return 0  # Zwróć 0, aby uniknąć dzielenia przez 0
-        elif position_type == "long":
-            return current_price * self.stop_loss_ratio
-        elif position_type == "short":
-            return current_price * self.stop_loss_ratio
-        else:
-            raise ValueError(f"Nieznany typ pozycji: {position_type}")
 
     def get_current_price(self):
         """Zwróć bieżącą cenę z danych."""
@@ -464,9 +466,6 @@ class TradingEnv(gym.Env):
     # Metody dostępowe do stanu
     def get_balance(self):
         return self.balance
-
-    def get_profit_or_loss(self):
-        return self.profit_or_loss
 
     def set_balance(self, amount):
         self.balance = amount
